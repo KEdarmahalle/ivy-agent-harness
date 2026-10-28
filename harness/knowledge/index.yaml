@@ -1,0 +1,15 @@
+{
+  "core": [
+    "harness/knowledge/fragments/evidence-discipline.md"
+  ],
+  "extended": [],
+  "specialized": {
+    "code-investigate": [
+      "harness/knowledge/fragments/code-investigation.md"
+    ],
+    "research-report": [
+      "harness/knowledge/fragments/research-citations.md"
+    ],
+    "brainstorm": []
+  }
+}

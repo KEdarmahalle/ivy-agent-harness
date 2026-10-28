@@ -1,0 +1,14 @@
+{
+  "graph": "research-report",
+  "input": {
+    "question": "What should an agent verification report include?",
+    "sources": [
+      {
+        "url": "https://example.local/verification",
+        "title": "Internal Verification Notes",
+        "content": "A reliable report ties every claim to a source, observation, or command output."
+      }
+    ]
+  },
+  "wait": true
+}

@@ -1,0 +1,78 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Agent Harness & Ivy local runtime data
+.harness/
+.ivy/
+*.sqlite3
+*.db
+*.log
+
+# Secrets & Environment variables
+.env
+.env.*
+!.env.example
+secrets/
+.secrets/
+
+# Testing & Linting
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# IDE & OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local Tooling & Scratch Artifacts
+_bmad/
+_bmad-output/
+.agents/
+agent-harness-plan.md
+scratch/
+stress_fixture/
+stress_fixture_2/
+
+
+# Local Tooling & Scratch Artifacts

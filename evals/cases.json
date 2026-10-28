@@ -1,0 +1,31 @@
+[
+  {
+    "name": "brainstorm returns ungated output",
+    "graph": "brainstorm",
+    "input": {
+      "prompt": "Plan a weekly verification review"
+    },
+    "expect": {
+      "status": "done",
+      "result.confidence": "not_gated"
+    }
+  },
+  {
+    "name": "research with a source-linked claim needs semantic review",
+    "graph": "research-report",
+    "input": {
+      "question": "What makes a claim verifiable?",
+      "sources": [
+        {
+          "url": "https://example.local/source",
+          "title": "Verification Note",
+          "content": "A claim is verifiable when it has a source or observed evidence."
+        }
+      ]
+    },
+    "expect": {
+      "status": "done",
+      "result.confidence": "CONCERNS"
+    }
+  }
+]

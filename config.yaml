@@ -1,0 +1,251 @@
+# ==============================================================================
+#                      UNIVERSAL AGENT HARNESS CONFIGURATION
+# ==============================================================================
+# This configuration controls all 5 phases of the agent harness:
+# 1. Multi-Model Routing & Resilient Failover Chains
+# 2. Modular Capability Packs & Dynamic Plugins
+# 3. Declarative Workflow Graphs, DAG State Machines & Swarms
+# 4. Real-time Event Streaming, Multi-Backend Storage & Time-Travel Checkpoints
+# 5. Enterprise Governance, RBAC, Multi-Tenancy & Cost Budgets
+# ==============================================================================
+
+app:
+  name: "Ivy Agent Harness"
+  version: "0.1.0"
+
+database:
+  # SQLite storage path for runs, traces, and state checkpoints
+  sqlite_path: ".harness/runs.sqlite3"
+
+auth:
+  # Set for any non-loopback API bind.
+  api_key: null
+
+api:
+  host: "127.0.0.1"
+  callback_hosts: []
+
+secrets:
+  # Path to local encrypted/json secrets store
+  store_path: ".harness/secrets.json"
+
+# ==============================================================================
+# Phase 1: Model Routing & Resilient Failover Chains
+# ==============================================================================
+models:
+  default:
+    provider: "fallback"
+    model: "deterministic-local"
+
+  gemini.flash:
+    provider: "litellm"
+    model: "gemini/gemini-3.5-flash-lite"
+    api_key_env: "GEMINI_API_KEY"
+    max_tokens: 4096
+    timeout_seconds: 60
+    retry_count: 0
+
+  nim.example:
+    provider: "nvidia_nim"
+    model: "nvidia/nemotron-3-super-120b-a12b"
+    api_key_env: "NVIDIA_NIM_API_KEY"
+    temperature: 0.0
+    max_tokens: 4096
+    timeout_seconds: 90
+    fallbacks:
+      - "nim.llama-70b"
+      - "nim.qwen-coder"
+      - "default"
+    retry_count: 2
+    retry_delay_seconds: 1.0
+
+  nim.nemotron:
+    provider: "nvidia_nim"
+    model: "nvidia/nemotron-3-super-120b-a12b"
+    api_key_env: "NVIDIA_NIM_API_KEY"
+    temperature: 0.0
+    max_tokens: 4096
+    timeout_seconds: 90
+    fallbacks:
+      - "nim.llama-70b"
+      - "nim.qwen-coder"
+      - "default"
+
+  nim.llama-70b:
+    provider: "nvidia_nim"
+    model: "meta/llama-3.3-70b-instruct"
+    api_key_env: "NVIDIA_NIM_API_KEY"
+    temperature: 0.0
+    max_tokens: 4096
+    timeout_seconds: 90
+
+  nim.qwen-coder:
+    provider: "nvidia_nim"
+    model: "qwen/qwen2.5-coder-32b-instruct"
+    api_key_env: "NVIDIA_NIM_API_KEY"
+    temperature: 0.0
+    max_tokens: 4096
+    timeout_seconds: 90
+
+  nim.mistral-large:
+    provider: "nvidia_nim"
+    model: "mistralai/mistral-large-2-instruct"
+    api_key_env: "NVIDIA_NIM_API_KEY"
+    temperature: 0.0
+    max_tokens: 4096
+    timeout_seconds: 90
+
+# ==============================================================================
+# Phase 2: Universal Capability Packs
+# ==============================================================================
+packs:
+  core:
+    enabled: true           # environment.info, tool.catalog, time.now, agent.delegate
+  filesystem:
+    enabled: true           # file.list, read, write, replace, search
+  data_analytics:
+    enabled: true           # data.sql_query, data.json_transform, data.csv_inspect
+  web_network:
+    enabled: true           # web.fetch_url
+  shell_sandbox:
+    enabled: true           # process.run, sandbox.inspect, sandbox.run_python
+  skills:
+    enabled: true           # skill.list, skill.view, skill.create
+
+# Tool permissions and execution-provider configuration
+tools:
+  allowlist:
+    - "environment.info"
+    - "tool.catalog"
+    - "time.now"
+    - "agent.delegate"
+    - "file.list"
+    - "file.read_text"
+    - "file.search_text"
+    - "file.read_lines"
+    - "file.replace_text"
+    - "file.write_text"
+    - "data.sql_query"
+    - "data.json_transform"
+    - "data.csv_inspect"
+    - "process.run"
+    - "sandbox.inspect"
+    - "sandbox.run_python"
+    - "skill.list"
+    - "skill.view"
+    - "skill.create"
+    - "web.fetch_url"
+  protected_paths:
+    - ".env"
+    - ".secrets"
+    - "secrets/"
+    - ".harness/"
+    - ".ssh/"
+    - "prod/"
+    - "production.yaml"
+    - "kubeconfig"
+    - ".env*"
+    - "*.pem"
+    - "*.key"
+    - "*.p12"
+    - "*.pfx"
+    - "*credentials*.json"
+  sandbox:
+    provider: "local"
+    # Local provider executes approved tool commands as this user on the host.
+    # Choose docker only when you have configured and started Docker.
+    image: "python:3.12-slim"
+    network_mode: "none"
+    workspace_roots:
+      - "."
+    writable_roots:
+      - "."
+    network_enabled: false
+    max_read_bytes: 262144
+    max_write_bytes: 262144
+    max_output_chars: 4000
+    default_timeout_seconds: 120
+
+# ==============================================================================
+# Phase 3: Declarative Workflow Graphs & Swarms
+# ==============================================================================
+graphs:
+  code-investigate:
+    description: "Multi-step source code investigation and automated reproduction"
+  research-report:
+    description: "Deep research collection, citation verification, and synthesis"
+  brainstorm:
+    description: "Creative problem-solving and architectural ideation"
+
+# ==============================================================================
+# Phase 4: Webhooks & Real-time Event Streaming
+# ==============================================================================
+webhooks:
+  enabled: false
+  endpoints: []
+  # Example:
+  # - url: "https://api.mycorp.com/agent-events"
+  #   secret: "my_hmac_secret_token"
+  #   event_filter: ["run_completed", "gate_triggered"]
+
+# ==============================================================================
+# Phase 5: Enterprise Governance & Budgets
+# ==============================================================================
+governance:
+  rate_limiting:
+    max_requests_per_minute: 60
+    max_concurrent_runs: 10
+  budgets:
+    max_tokens_per_run: 100000
+    max_cost_usd_per_run: 1.00
+  rbac:
+    restricted_tools:
+      "process.run": ["admin", "developer"]
+      "sandbox.run_python": ["admin", "developer", "data_scientist"]
+      "data.sql_query": ["admin", "developer", "data_analyst", "user"]
+
+# ==============================================================================
+# Interactive Chat & Agentic Loop
+# ==============================================================================
+chat:
+  graph: "nim"
+  node: "nemotron"
+  agent_name: "Ivy"
+  system_prompt: "You are Ivy, an expert autonomous software engineering agent and pair programmer running inside Agent Harness."
+  max_history_messages: 30
+  streaming:
+    enabled: true
+    live_tokens: true
+    show_token_rate: true
+  agent_loop:
+    enabled: true
+    max_tool_steps: 10
+    max_tokens: 4096
+    auto_approve_tools: true
+    tool_calling_mode: "auto"
+    tool_budget_prompt: >-
+      The tool-step budget is exhausted. Do not request more tools. Report the
+      observed command results exactly. Never claim checks passed after a
+      non-zero exit, an unavailable command, or a workspace mutation that
+      occurred after the last successful check. Clearly state any unfinished work.
+  ui:
+    style: "rich"
+    tool_display: "compact"
+    show_tool_args: true
+    show_tool_result_excerpt: true
+    tool_result_excerpt_chars: 1200
+    show_step_timing: true
+    spinner: "dots"
+
+# MCP External Server Connections
+mcp_servers:
+  utility:
+    transport: "stdio"
+    command: "python"
+    args:
+      - "-m"
+      - "harness.mcp_server"
+
+observability:
+  langfuse:
+    enabled: false

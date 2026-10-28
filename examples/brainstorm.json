@@ -1,0 +1,7 @@
+{
+  "graph": "brainstorm",
+  "input": {
+    "prompt": "Plan an internal agent reliability review process"
+  },
+  "wait": true
+}
