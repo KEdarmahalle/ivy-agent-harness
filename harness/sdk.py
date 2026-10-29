@@ -156,7 +156,63 @@ class AgentHarness:
             tools=self.tools,
             models=self.models,
             config=self.config,
+            skills=self.skills,
         )
+        self.tools.delegate_dispatcher = self._dispatch_agent
+        self.tools.plan_dispatcher = self._dispatch_plan
+
+    def _dispatch_agent(self, agent: str, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+        """Bridge synchronous chat tools to the asynchronous coordinator safely."""
+        import contextvars
+        import threading
+        inherited_context = contextvars.copy_context()
+        result: list[dict[str, Any]] = []
+        error: list[Exception] = []
+        def execute() -> None:
+            try:
+                result.append(asyncio.run(self.swarm_coordinator.run_agent(agent, prompt, context, requester=self.swarm_coordinator.chat_entry_profile)))
+            except Exception as exc:  # noqa: BLE001 - propagate coordinator failure to tool boundary
+                error.append(exc)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            execute()
+        else:
+            worker = threading.Thread(target=lambda: inherited_context.run(execute), daemon=True)
+            worker.start()
+            worker.join()
+        if error:
+            raise error[0]
+        return result[0] if result else {"ok": False, "status": "failed", "agent": agent, "error": "dispatcher produced no result"}
+
+    def _dispatch_plan(self, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+        import contextvars
+        import threading
+
+        from harness.events import current_event_run_id
+        run_id = current_event_run_id()
+        inherited_context = contextvars.copy_context()
+        profile = self.swarm_coordinator.chat_entry_profile
+        if not profile:
+            return {"ok": False, "status": "unavailable", "error": "chat_entry_profile is not configured"}
+        result: list[dict[str, Any]] = []
+        error: list[Exception] = []
+        def execute() -> None:
+            try:
+                result.append(asyncio.run(self.swarm_coordinator.plan(profile, prompt, context, run_id=run_id)))
+            except Exception as exc:  # noqa: BLE001
+                error.append(exc)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            execute()
+        else:
+            worker = threading.Thread(target=lambda: inherited_context.run(execute), daemon=True)
+            worker.start()
+            worker.join()
+        if error:
+            raise error[0]
+        return result[0] if result else {"ok": False, "status": "failed", "error": "planner produced no result"}
 
     @classmethod
     def from_project(
@@ -183,25 +239,46 @@ class AgentHarness:
             graph = parts[0]
             node = parts[1] if len(parts) > 1 else "default"
 
+        entry_profile = self.swarm_coordinator.chat_entry_profile
+        entry_spec = self.swarm_coordinator.agents.get(entry_profile) if entry_profile else None
+        if entry_spec and not cfg.route and cfg.graph == RunConfig().graph and cfg.node == RunConfig().node:
+            route_parts = entry_spec.route.split(".", 1)
+            graph = route_parts[0]
+            node = route_parts[1] if len(route_parts) > 1 else "default"
+
         max_steps = cfg.max_tool_steps
         max_tokens = cfg.max_tokens
 
         # Resolve system prompt & context
-        base_system = cfg.system_prompt or str(
+        base_system = cfg.system_prompt or (entry_spec.system_prompt if entry_spec else str(
             deep_get(
                 self.config,
                 "chat.system_prompt",
                 "You are Ivy, an expert autonomous software engineering agent running inside Agent Harness.",
             )
-        )
+        ))
         harness_ctx = build_harness_context(self.config)
         skills_ctx = self.skills.render_skills_prompt_catalog()
         project_ctx = self.profile.to_prompt_context()
         memory_ctx = self.memory.format_context(prompt)
 
         tools_catalog = self.tools.catalog()
+        if entry_spec:
+            permitted = set(entry_spec.tools)
+            if self.swarm_coordinator.mode == "single":
+                permitted.update(name for name in ("agent.delegate",) if name in self.tools.names() and (not self.tools.allowlist or name in self.tools.allowlist))
+            elif self.swarm_coordinator.mode in {"self_directed", "required"} and entry_spec.delegation.get("enabled", False):
+                permitted.update(self.swarm_coordinator._orchestration_tools(entry_spec))
+            tools_catalog = {name: meta for name, meta in tools_catalog.items() if name in permitted}
+        if "agent.delegate" in tools_catalog:
+            names = self.swarm_coordinator.eligible_profiles(entry_profile) if entry_profile and self.swarm_coordinator.mode in {"self_directed", "required"} else [{"id": name, "description": spec.description[:300]} for name, spec in self.swarm_coordinator.agents.items()]
+            tools_catalog["agent.delegate"]["description"] += " Eligible profiles: " + json.dumps(names, ensure_ascii=False)[:3000]
+        if "agent.plan" in tools_catalog and entry_profile:
+            cards = self.swarm_coordinator.eligible_profiles(entry_profile)
+            tools_catalog["agent.plan"]["description"] += " Eligible profiles: " + json.dumps(cards, ensure_ascii=False)[:3000]
         if cfg.tools_filter:
             tools_catalog = {k: v for k, v in tools_catalog.items() if k in cfg.tools_filter}
+        chat_allowed_tools = set(tools_catalog)
 
         system_content = build_smart_system_prompt(
             base_prompt=base_system,
@@ -222,14 +299,13 @@ class AgentHarness:
         all_tool_records: list[dict[str, Any]] = []
         final_text = ""
         run_id = f"chat_{uuid4().hex}"
+        plan_authorized = self.swarm_coordinator.mode != "required"
 
         # Event listener for subagent and swarm lifecycle events
         def handle_subagent_event(event: Any) -> None:
-            if (
-                hasattr(event, "event_type")
-                and event.event_type == "subagent_completed"
-                and event.run_id == run_id
-            ):
+            if hasattr(event, "event_type") and event.run_id == run_id and event.event_type.startswith(("plan_", "task_", "orchestration_")):
+                event_queue.append(StreamEvent(type=event.event_type, metadata={"run_id": event.run_id, **getattr(event, "payload", {})}))
+            elif (hasattr(event, "event_type") and event.event_type == "subagent_completed" and event.run_id == run_id):
                 payload = getattr(event, "payload", {})
                 yielded_event = StreamEvent(
                     type="subagent_completed",
@@ -304,7 +380,14 @@ class AgentHarness:
                     t_start = time.perf_counter()
                     run_token = set_current_event_run_id(run_id)
                     try:
-                        observation = execute_chat_tool(self.tools, tc)
+                        if tc.get("tool") not in chat_allowed_tools:
+                            observation = {"ok": False, "tool": tc.get("tool"), "error": "tool is outside the configured chat profile scope"}
+                        elif self.swarm_coordinator.mode == "required" and not plan_authorized and tc.get("tool") != "agent.plan":
+                            observation = {"ok": False, "tool": tc.get("tool"), "error": "a validated orchestration plan is required before tool execution"}
+                        else:
+                            observation = execute_chat_tool(self.tools, tc)
+                            if tc.get("tool") == "agent.plan" and observation.get("ok"):
+                                plan_authorized = True
                     finally:
                         reset_current_event_run_id(run_token)
                     t_dur_ms = (time.perf_counter() - t_start) * 1000.0
@@ -462,6 +545,42 @@ class AgentHarness:
     def list_tools(self) -> list[str]:
         """List all currently allowed and registered tool names."""
         return self.tools.names()
+
+    def validate_plan(self, proposal: dict[str, Any], run_context: Any, context_refs: dict[str, Any] | None = None) -> Any:
+        """Validate a model-proposed plan before it is executed."""
+        return self.swarm_coordinator.validate_plan(proposal, run_context, context_refs)
+
+    def plan(self, prompt: str, context_refs: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Synchronously propose, validate, and execute a configured plan."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.aplan(prompt, context_refs))
+        raise RuntimeError("AgentHarness.plan cannot run inside an event loop; use aplan")
+
+    async def aplan(self, prompt: str, context_refs: dict[str, Any] | None = None) -> dict[str, Any]:
+        profile = self.swarm_coordinator.chat_entry_profile
+        if not profile:
+            return {"ok": False, "status": "unavailable", "error": "chat_entry_profile is not configured"}
+        return await self.swarm_coordinator.plan(profile, prompt, context_refs)
+
+    def execute_plan(self, proposal: dict[str, Any], context_refs: dict[str, Any] | None = None, *, profile: str | None = None) -> dict[str, Any]:
+        """Execute a deterministic, host-supplied plan using configured profiles."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.aexecute_plan(proposal, context_refs, profile=profile))
+        raise RuntimeError("AgentHarness.execute_plan cannot run inside an event loop; use aexecute_plan")
+
+    async def aexecute_plan(self, proposal: dict[str, Any], context_refs: dict[str, Any] | None = None, *, profile: str | None = None) -> dict[str, Any]:
+        entry_profile = profile or self.swarm_coordinator.chat_entry_profile
+        if not entry_profile:
+            return {"ok": False, "status": "unavailable", "error": "chat_entry_profile is not configured"}
+        return await self.swarm_coordinator.run_configured_plan(entry_profile, proposal, context_refs)
+
+    async def aexecute_validated_plan(self, validated_plan: Any, run_context: Any, context_refs: dict[str, Any] | None = None, cancellation: Any = None) -> dict[str, Any]:
+        """Execute a previously validated plan without starting a nested event loop."""
+        return await self.swarm_coordinator.execute_plan(validated_plan, run_context, context_refs, cancellation)
 
 
 __all__ = ["AgentHarness", "AgentResult", "RunConfig", "StreamEvent", "tool"]

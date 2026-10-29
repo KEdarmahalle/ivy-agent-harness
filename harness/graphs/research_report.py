@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from harness.engine.graph import GraphSpec, NodeSpec
 from harness.engine.schemas import Evidence, NodeResult, RunSnapshot
 from harness.gates.verification_gate import score_and_gate
+from harness.parser.structured_json import StructuredJSONError, parse_json_object_response
 
 MAX_QUESTION_CHARS = 4_000
 MAX_SOURCES = 20
@@ -18,7 +19,7 @@ MAX_URL_SOURCES = 5
 MAX_SOURCE_BYTES = 32_000
 MAX_TOTAL_SOURCE_BYTES = 128_000
 MAX_TITLE_CHARS = 500
-MAX_MODEL_OUTPUT_CHARS = 20_000
+MAX_MODEL_OUTPUT_BYTES = 20_000
 MAX_CLAIMS = 20
 MAX_QUOTES_PER_CLAIM = 3
 MAX_QUOTE_CHARS = 1_000
@@ -133,19 +134,24 @@ def synthesize(context: Any, snapshot: RunSnapshot) -> NodeResult:
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
     raw = context.models.complete("research-report", "synthesize", messages)
-    context.trace("model_called", {"node": "synthesize", "source_count": len(sources), "output_chars": min(len(raw), MAX_MODEL_OUTPUT_CHARS)})
+    raw_chars = len(raw) if isinstance(raw, str) else 0
+    context.trace("model_called", {"node": "synthesize", "source_count": len(sources), "output_chars": raw_chars})
     issues: list[str] = []
     parsed: dict[str, Any] | None = None
-    if isinstance(raw, str) and len(raw) <= MAX_MODEL_OUTPUT_CHARS:
+    if isinstance(raw, str):
         try:
-            value = json.loads(raw)
-            if isinstance(value, dict) and set(value) == {"summary", "claims"} and isinstance(value["summary"], str) and isinstance(value["claims"], list):
+            value = parse_json_object_response(
+                raw,
+                required_keys={"summary", "claims"},
+                max_bytes=MAX_MODEL_OUTPUT_BYTES,
+            )
+            if isinstance(value["summary"], str) and isinstance(value["claims"], list):
                 parsed = value
-        except (json.JSONDecodeError, TypeError):
+        except StructuredJSONError:
             pass
     if parsed is None:
         issues.append("malformed_model_output")
-    report = {"question": snapshot.state.get("question", ""), "summary": parsed["summary"][:4_000] if parsed else (raw[:2_000] if isinstance(raw, str) else "Model returned a non-text response"), "key_points": [], "citation_count": 0, "issues": issues, "semantic_review_required": True}
+    report = {"question": snapshot.state.get("question", ""), "summary": parsed["summary"][:4_000] if parsed else "Model returned an invalid structured response; no claims were accepted.", "key_points": [], "citation_count": 0, "issues": issues, "semantic_review_required": True}
     evidence: list[Evidence] = []
     if parsed:
         sources_by_id = {source["source_id"]: source for source in sources}

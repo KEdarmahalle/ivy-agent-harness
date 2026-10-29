@@ -198,6 +198,28 @@ class ModelRegistryTests(unittest.TestCase):
             )
             self.assertEqual(completion.call_args.kwargs["max_tokens"], 8192)
 
+    def test_complete_passes_native_json_mode_to_litellm(self) -> None:
+        registry = ModelRegistry.from_config(
+            {
+                "models": {
+                    "nim.example": {
+                        "provider": "nvidia_nim",
+                        "model": "meta/llama-3.1-8b-instruct",
+                    }
+                }
+            }
+        )
+        with (
+            patch.dict(os.environ, {"NVIDIA_NIM_API_KEY": "test-secret"}, clear=False),
+            patch("litellm.completion", return_value=completion_response('{"ok":true}')) as completion,
+        ):
+            response = registry.complete(
+                "nim", "example", [{"role": "user", "content": "Return JSON."}],
+                response_format={"type": "json_object"},
+            )
+        self.assertEqual(response, '{"ok":true}')
+        self.assertEqual(completion.call_args.kwargs["response_format"], {"type": "json_object"})
+
     def test_complete_supports_streaming(self) -> None:
         registry = ModelRegistry.from_config(
             {

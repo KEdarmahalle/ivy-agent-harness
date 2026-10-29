@@ -98,7 +98,14 @@ def execute_chat_tool(tools: Any, tool_call: dict[str, Any]) -> dict[str, Any]:
         result = tools.invoke(tool_call["tool"], **tool_call["args"])
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "tool": tool_call.get("tool"), "error": f"{type(exc).__name__}: {exc}"}
-    return {"ok": True, "tool": tool_call["tool"], "result": result}
+    # Tool handlers may return structured failures without raising (for example,
+    # rejected plans or unavailable integrations). Preserve that status so
+    # policy gates cannot mistake a failed operation for an authorized success.
+    ok = bool(result.get("ok", True)) if isinstance(result, dict) else True
+    observation = {"ok": ok, "tool": tool_call["tool"], "result": result}
+    if not ok and isinstance(result, dict) and result.get("error"):
+        observation["error"] = str(result["error"])[:1000]
+    return observation
 
 
 def summarize_tool_observations(observations: list[dict[str, Any]]) -> str:

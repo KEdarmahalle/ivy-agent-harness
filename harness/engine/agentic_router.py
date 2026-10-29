@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from harness.events import AgenticRouteDecisionEvent, global_event_bus
-from harness.parser.json_repair import repair_truncated_json
+from harness.parser.structured_json import StructuredJSONError, parse_json_object_response
 from harness.registries.model_registry import ModelRegistry
 
 
@@ -135,22 +135,17 @@ class AgenticGraphRouter:
         return decision
 
     def _parse_decision(self, raw_text: str, candidates: dict[str, Any]) -> AgenticRouteDecision:
-        clean = raw_text.strip()
-        match = re.search(r"\{.*\}", clean, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-        else:
-            json_str = repair_truncated_json(clean)
-
         parse_error: str | None = None
         try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError:
-            data = {"action": "finish", "next_node": None, "rationale": "Invalid route response."}
-            parse_error = "invalid_json"
-        if not isinstance(data, dict):
-            data = {"action": "finish", "next_node": None, "rationale": "Invalid router response."}
-            parse_error = "invalid_response"
+            data = parse_json_object_response(
+                raw_text,
+                required_keys={"action", "next_node"},
+                max_bytes=16_000,
+                exact_keys=False,
+            )
+        except StructuredJSONError as exc:
+            data = {"action": "finish", "next_node": None, "rationale": "Invalid route response.", "state_updates": {}}
+            parse_error = exc.code
 
         action = str(data.get("action", "advance")).lower()
         if action not in {"advance", "skip", "backtrack", "finish"}:
@@ -158,7 +153,11 @@ class AgenticGraphRouter:
             parse_error = "invalid_action"
 
         next_node = data.get("next_node")
-        if next_node and next_node not in candidates:
+        if action != "finish" and (not isinstance(next_node, str) or not next_node):
+            next_node = None
+            action = "finish"
+            parse_error = "missing_target"
+        elif action != "finish" and next_node not in candidates:
             # Match case-insensitively or fuzzy
             for c_name in candidates:
                 if c_name.lower() == str(next_node).lower():
@@ -171,8 +170,6 @@ class AgenticGraphRouter:
 
         if action == "finish":
             next_node = None
-        elif not next_node and not parse_error:
-            parse_error = "missing_target"
 
         updates = data.get("state_updates", {})
         if not isinstance(updates, dict) or len(updates) > 64:

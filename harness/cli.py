@@ -196,7 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     swarm = sub.add_parser("swarm", help="Run multi-agent swarm tasks (fanout / handoff)")
     swarm.add_argument("--pattern", choices=["fanout", "handoff"], default="fanout", help="Swarm coordination pattern")
-    swarm.add_argument("--agents", default="analyst,reviewer", help="Comma-separated agent names")
+    swarm.add_argument("--agents", default=None, help="Comma-separated agent names")
     swarm.add_argument("--task", default="Inspect workspace and summarize status", help="Task description")
 
     run = sub.add_parser("run", help="Create a run")
@@ -347,28 +347,23 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run_swarm(args: argparse.Namespace) -> int:
-    from harness.swarm import SwarmAgentSpec, SwarmCoordinator
+    from harness.swarm import SwarmCoordinator
 
     config = load_config(args.config)
     load_secrets(config, path=args.secret_store)
     tools = ToolRegistry.from_config(config)
     models = ModelRegistry.from_config(config)
+    skills = SkillRegistry(workspace_root=".")
     ui_console = Console() if Console is not None else None
 
-    agent_names = [a.strip() for a in args.agents.split(",") if a.strip()]
+    coord = SwarmCoordinator.from_default_config(models=models, tools=tools, config=config, skills=skills)
+    raw_agents = getattr(args, "agents", None)
+    agent_names = [a.strip() for a in raw_agents.split(",") if a.strip()] if raw_agents else []
     if not agent_names:
-        agent_names = ["analyst", "reviewer"]
-
-    swarm_agents = {
-        "analyst": SwarmAgentSpec(name="analyst", system_prompt="Analyze repository, list files, and inspect status.", tools=["file.list", "time.now"]),
-        "reviewer": SwarmAgentSpec(name="reviewer", system_prompt="Review findings and synthesize executive report.", tools=[]),
-        "security": SwarmAgentSpec(name="security", system_prompt="Audit security risks and permissions.", tools=["file.search_text"]),
-    }
-    for name in agent_names:
-        if name not in swarm_agents:
-            swarm_agents[name] = SwarmAgentSpec(name=name, system_prompt=f"Specialized {name} agent.", tools=["file.list", "time.now"])
-
-    coord = SwarmCoordinator(agents=swarm_agents, models=models, tools=tools)
+        entry = coord.chat_entry_profile
+        if not entry:
+            raise ValueError("--agents is required when orchestration.chat_entry_profile is not configured")
+        agent_names = [entry]
 
     if ui_console:
         ui_console.print(f"\n[bold #a855f7]⚡ MULTI-AGENT SWARM EXECUTION ({args.pattern.upper()})[/bold #a855f7]")
@@ -412,7 +407,7 @@ def run_swarm(args: argparse.Namespace) -> int:
         else:
             print(json.dumps(res, indent=2, default=str))
     else:
-        res = asyncio.run(coord.run_fan_out(agent_names=agent_names, task=args.task, synthesizer_agent="reviewer", on_event=handle_swarm_event))
+        res = asyncio.run(coord.run_fan_out(agent_names=agent_names, task=args.task, synthesizer_agent=coord.planner_profile, on_event=handle_swarm_event))
         if ui_console:
             ui_console.print(f"\n[bold white on green] ✓ SWARM SYNTHESIS [/bold white on green]\n{res.get('synthesis')}\n")
         else:
@@ -480,11 +475,19 @@ def run_chat(args: argparse.Namespace) -> int:
     load_secrets(config, path=args.secret_store)
     graph = getattr(args, "graph", None) or deep_get(config, "chat.graph", "nim")
     node = getattr(args, "node", None) or deep_get(config, "chat.node", "nemotron")
+    configured_entry = deep_get(config, "orchestration.chat_entry_profile")
+    profile_data = deep_get(config, f"agents.profiles.{configured_entry}", {}) if configured_entry else {}
+    if configured_entry and isinstance(profile_data, dict) and not getattr(args, "graph", None) and not getattr(args, "node", None):
+        route_parts = str(profile_data.get("route", f"{graph}.{node}")).split(".", 1)
+        graph = route_parts[0]
+        node = route_parts[1] if len(route_parts) > 1 else "default"
     system_prompt = getattr(args, "system", None) or deep_get(
         config,
         "chat.system_prompt",
         "You are Ivy, an expert autonomous software engineering agent running inside Agent Harness.",
     )
+    if configured_entry and isinstance(profile_data, dict) and not getattr(args, "system", None):
+        system_prompt = str(profile_data.get("system_prompt", system_prompt))
     max_history_messages = int(deep_get(config, "chat.max_history_messages", 30))
     loop_enabled = bool(deep_get(config, "chat.agent_loop.enabled", True))
     max_tool_steps = int(
@@ -514,6 +517,67 @@ def run_chat(args: argparse.Namespace) -> int:
     mcp = MCPRegistry.from_config(config)
     registry = ModelRegistry.from_config(config)
     tools = ToolRegistry.from_config(config)
+    from harness.swarm import SwarmCoordinator
+    coordinator = (
+        SwarmCoordinator.from_default_config(models=registry, tools=tools, config=config, skills=skills)
+        if isinstance(getattr(registry, "routes", None), dict)
+        else None
+    )
+    def dispatch_profile(agent: str, prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+        if coordinator is None:
+            return {"ok": False, "status": "unavailable", "agent": agent, "error": "model registry unavailable"}
+        import asyncio
+        import contextvars
+        import threading
+        inherited_context = contextvars.copy_context()
+        result: list[dict[str, Any]] = []
+        error: list[Exception] = []
+        def run() -> None:
+            try:
+                result.append(asyncio.run(coordinator.run_agent(agent, prompt, context, requester=configured_entry)))
+            except Exception as exc:  # noqa: BLE001 - surfaced by the delegate tool boundary
+                error.append(exc)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            run()
+        else:
+            worker = threading.Thread(target=lambda: inherited_context.run(run), daemon=True)
+            worker.start()
+            worker.join()
+        if error:
+            raise error[0]
+        return result[0]
+    tools.delegate_dispatcher = dispatch_profile
+    def dispatch_plan(prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+        if coordinator is None or not configured_entry:
+            return {"ok": False, "status": "unavailable", "error": "configured planning entrypoint is unavailable"}
+        import asyncio
+        import contextvars
+        import threading
+
+        from harness.events import current_event_run_id
+        run_id = current_event_run_id()
+        inherited_context = contextvars.copy_context()
+        result: list[dict[str, Any]] = []
+        error: list[Exception] = []
+        def run() -> None:
+            try:
+                result.append(asyncio.run(coordinator.plan(configured_entry, prompt, context, run_id=run_id)))
+            except Exception as exc:  # noqa: BLE001
+                error.append(exc)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            run()
+        else:
+            worker = threading.Thread(target=lambda: inherited_context.run(run), daemon=True)
+            worker.start()
+            worker.join()
+        if error:
+            raise error[0]
+        return result[0] if result else {"ok": False, "status": "failed", "error": "planner produced no result"}
+    tools.plan_dispatcher = dispatch_plan
     features = FeatureRegistry()
     route = registry.route_for(graph, node)
     ui = ChatUI(
@@ -541,9 +605,27 @@ def run_chat(args: argparse.Namespace) -> int:
     skills_context = skills.render_skills_prompt_catalog()
     project_profile = detect_project(".")
     project_context = project_profile.render_context_summary()
+    chat_tool_catalog = tools.catalog()
+    if coordinator is not None and "agent.delegate" in chat_tool_catalog:
+        profile_names = ", ".join(f"{name}: {spec.description or spec.system_prompt[:120]}" for name, spec in coordinator.agents.items())
+        chat_tool_catalog["agent.delegate"]["description"] += f" Registered profiles: {profile_names}. Select only one of these names."
+    if coordinator is not None and configured_entry and configured_entry in coordinator.agents:
+        entry = coordinator.agents[configured_entry]
+        permitted = set(entry.tools)
+        if coordinator.mode == "single" and "agent.delegate" in tools.names() and (not tools.allowlist or "agent.delegate" in tools.allowlist):
+            permitted.add("agent.delegate")
+        elif coordinator.mode in {"self_directed", "required"} and entry.delegation.get("enabled", False):
+            permitted.update(coordinator._orchestration_tools(entry))
+        chat_tool_catalog = {name: meta for name, meta in chat_tool_catalog.items() if name in permitted}
+        if "agent.delegate" in chat_tool_catalog:
+            cards = coordinator.eligible_profiles(configured_entry) if coordinator.mode in {"self_directed", "required"} else [{"id": name, "description": spec.description[:300]} for name, spec in coordinator.agents.items()]
+            chat_tool_catalog["agent.delegate"]["description"] += " Eligible profiles: " + str(cards)[:3000]
+        if "agent.plan" in chat_tool_catalog:
+            chat_tool_catalog["agent.plan"]["description"] += " Eligible profiles: " + str(coordinator.eligible_profiles(configured_entry))[:3000]
+    chat_allowed_tools = set(chat_tool_catalog)
     smart_system_prompt = build_smart_system_prompt(
         base_prompt=system_prompt,
-        tools_catalog=tools.catalog(),
+        tools_catalog=chat_tool_catalog,
         harness_context=harness_context,
         memory_context=memory_context,
         skills_context=skills_context,
@@ -561,6 +643,7 @@ def run_chat(args: argparse.Namespace) -> int:
 
     def complete(prompt: str) -> str:
         start_time = time.perf_counter()
+        plan_authorized = coordinator is None or coordinator.mode != "required"
         messages.append({"role": "user", "content": prompt})
         observations: list[dict[str, Any]] = []
         verification_runs: list[dict[str, Any]] = []
@@ -578,7 +661,7 @@ def run_chat(args: argparse.Namespace) -> int:
             current_max_tokens = int(deep_get(config, "chat.agent_loop.max_tokens", max_tokens))
             is_streaming = bool(deep_get(config, "chat.streaming.enabled", True))
             tool_mode = str(deep_get(config, "chat.agent_loop.tool_calling_mode", "auto")).lower()
-            openai_tools = tools.to_openai_tools() if loop_enabled and tool_mode in {"auto", "native"} else None
+            openai_tools = tools.to_openai_tools(sorted(chat_allowed_tools)) if loop_enabled and tool_mode in {"auto", "native"} else None
 
             def handle_failover(from_r: str, to_r: str, err: Exception) -> None:
                 if ui.console:
@@ -655,6 +738,20 @@ def run_chat(args: argparse.Namespace) -> int:
                 tool_spec = tools.catalog().get(tool_name, {})
                 requires_approval = bool(tool_spec.get("requires_approval") or tool_spec.get("mutates_state"))
 
+                if tool_name not in chat_allowed_tools:
+                    observation = {"ok": False, "tool": tool_name, "error": "tool is outside the configured chat profile scope"}
+                    observations.append(observation)
+                    step_observations.append(observation)
+                    ui.tool_result(observation, duration_ms=0.0)
+                    continue
+
+                if coordinator is not None and coordinator.mode == "required" and not plan_authorized and tool_name != "agent.plan":
+                    observation = {"ok": False, "tool": tool_name, "error": "a validated orchestration plan is required before tool execution"}
+                    observations.append(observation)
+                    step_observations.append(observation)
+                    ui.tool_result(observation, duration_ms=0.0)
+                    continue
+
                 ui.tool_call(tool_call, step=step_count, max_steps=max_tool_steps, spec=tool_spec)
 
                 # Human-in-the-loop permission check if tool requires approval
@@ -681,6 +778,8 @@ def run_chat(args: argparse.Namespace) -> int:
                 tool_start = time.perf_counter()
                 with ui.status(f"Executing {tool_name}..."):
                     observation = execute_chat_tool(tools, tool_call)
+                if tool_name == "agent.plan" and observation.get("ok"):
+                    plan_authorized = True
                 tool_elapsed_ms = (time.perf_counter() - tool_start) * 1000.0
 
                 check_command = verification_command(tool_call)
@@ -872,17 +971,15 @@ def run_chat(args: argparse.Namespace) -> int:
                 print(msg)
             continue
         if command.startswith(("/subagents", "/swarm")):
-            from harness.swarm import SwarmAgentSpec, SwarmCoordinator
             parts = prompt.strip().split(maxsplit=1)
             sub_task = parts[1] if len(parts) > 1 else "Inspect workspace and summarize status"
             if ui.console:
-                ui.console.print(f"\n[bold #a855f7]🤖 Spawning Multi-Agent Swarm for subtask:[/bold #a855f7] [cyan]{sub_task}[/cyan]")
-            swarm_agents = {
-                "analyst": SwarmAgentSpec(name="analyst", system_prompt="Analyze workspace status and files.", tools=["file.list", "time.now"]),
-                "reviewer": SwarmAgentSpec(name="reviewer", system_prompt="Review findings and synthesize.", tools=[]),
-            }
-            coord = SwarmCoordinator(agents=swarm_agents, models=registry, tools=tools)
-            res = asyncio.run(coord.run_fan_out(["analyst", "reviewer"], sub_task))
+                ui.console.print(f"\n[bold #a855f7]Spawning configured swarm for subtask:[/bold #a855f7] [cyan]{sub_task}[/cyan]")
+            selected = [name for name in ("analyst", "reviewer") if coordinator and name in coordinator.agents]
+            if not coordinator or not selected:
+                res = {"status": "failed", "error": "No configured swarm profiles are available."}
+            else:
+                res = asyncio.run(coordinator.run_fan_out(selected, sub_task, synthesizer_agent=coordinator.planner_profile))
             if ui.console:
                 for a_name, a_out in res.get("findings", {}).items():
                     ui.console.print(f"  [bold cyan]● Subagent [{a_name}]:[/bold cyan] {a_out}")

@@ -170,6 +170,7 @@ class ModelRegistry:
         temperature: float | None = None,
         stream: bool = False,
         tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
         on_chunk: Callable[[str], None] | None = None,
         on_failover: Callable[[str, str, Exception], None] | None = None,
     ) -> ModelResponse:
@@ -202,6 +203,7 @@ class ModelRegistry:
                             temperature=effective_temp,
                             stream=stream,
                             tools=tools,
+                            response_format=response_format,
                             on_chunk=on_chunk,
                         )
                         res.route_used = route_name
@@ -215,6 +217,7 @@ class ModelRegistry:
                             temperature=effective_temp,
                             stream=stream,
                             tools=tools,
+                            response_format=response_format,
                             on_chunk=on_chunk,
                         )
                         res.route_used = route_name
@@ -270,6 +273,7 @@ class ModelRegistry:
         temperature: float | None = None,
         stream: bool = False,
         tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> ModelResponse:
         api_key = self._api_key_from_env(route)
@@ -284,6 +288,7 @@ class ModelRegistry:
             temperature=temperature,
             stream=stream,
             tools=tools,
+            response_format=response_format,
             on_chunk=on_chunk,
         )
 
@@ -298,6 +303,7 @@ class ModelRegistry:
         temperature: float | None = None,
         stream: bool = False,
         tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> ModelResponse:
         try:
@@ -321,6 +327,8 @@ class ModelRegistry:
         kwargs["max_tokens"] = tokens
         if route.timeout_seconds is not None:
             kwargs["timeout"] = route.timeout_seconds
+        if response_format is not None:
+            kwargs["response_format"] = response_format
         def _execute_call(pass_tools: bool) -> Any:
             call_kwargs = dict(kwargs)
             if pass_tools and tools:

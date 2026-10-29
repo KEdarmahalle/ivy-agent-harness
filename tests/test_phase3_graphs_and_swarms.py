@@ -146,8 +146,8 @@ class Phase3GraphsAndSwarmsTests(unittest.TestCase):
             self.assertEqual(snap_normal.status, "done")
             self.assertIn("approve_transaction_output", snap_normal.state)
 
-    def test_multi_agent_delegation_tool(self) -> None:
-        """Adversarial test: Sub-agent persona delegation tool."""
+    def test_multi_agent_delegation_tool_fails_closed_when_unconfigured(self) -> None:
+        """Delegation without a configured dispatcher must never simulate completion."""
         tools = ToolRegistry()
         res = tools.invoke(
             "agent.delegate",
@@ -155,9 +155,8 @@ class Phase3GraphsAndSwarmsTests(unittest.TestCase):
             prompt="Optimize slow SQL index on users table",
             context={"query_time_ms": 420},
         )
-        self.assertEqual(res["delegated_to"], "database_specialist")
-        self.assertEqual(res["status"], "completed")
-        self.assertIn("Optimize slow SQL index", res["observation"])
+        self.assertEqual(res["status"], "unavailable")
+        self.assertFalse(res["ok"])
 
     def test_graph_discovery_and_registry(self) -> None:
         """Test listing and loading graphs dynamically."""

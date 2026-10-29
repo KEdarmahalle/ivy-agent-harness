@@ -15,7 +15,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from harness.config import deep_get
 from harness.governance import current_tenant
@@ -34,6 +33,7 @@ DOMAIN_PACKS: dict[str, list[str]] = {
         "tool.catalog",
         "time.now",
         "agent.delegate",
+        "agent.plan",
     ],
     "filesystem": [
         "file.list",
@@ -90,6 +90,13 @@ BUILTIN_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "category": "multi_agent",
         "origin": "builtin.core",
         "input_schema": {"agent": "string", "prompt": "string", "context": "object?"},
+    },
+    "agent.plan": {
+        "handler": "_plan_agents",
+        "description": "Propose and execute a validated dependency-aware task plan using configured profiles",
+        "category": "multi_agent",
+        "origin": "builtin.core",
+        "input_schema": {"prompt": "string", "context": "object?"},
     },
     # Filesystem Pack
     "file.list": {
@@ -255,6 +262,8 @@ class ToolRegistry:
         packs_config: dict[str, Any] | None = None,
         sandbox_provider: SandboxProvider | None = None,
         restricted_tools: dict[str, list[str]] | None = None,
+        delegate_dispatcher: Callable[..., dict[str, Any]] | None = None,
+        plan_dispatcher: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
         self.allowlist = list(allowlist or [])
         mandatory_protected = [
@@ -274,6 +283,8 @@ class ToolRegistry:
         self.mcp = mcp or MCPRegistry({})
         self.plugins = plugins or PluginRegistry()
         self.packs_config = packs_config or {}
+        self.delegate_dispatcher = delegate_dispatcher
+        self.plan_dispatcher = plan_dispatcher
         self._tools: dict[str, RegisteredTool] = {}
         self._register_builtin_tools()
         self._register_mcp_tools()
@@ -597,102 +608,32 @@ class ToolRegistry:
         agent: str,
         prompt: str,
         context: dict[str, Any] | None = None,
-        tools: list[str] | None = None,
         **_kwargs: Any,
     ) -> dict[str, Any]:
-        """Delegate a subtask to a specialized subagent persona with autonomous tool execution."""
-        from harness.events import current_event_run_id, global_event_bus
+        if not isinstance(agent, str) or len(agent) > 80 or not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000:
+            return {"ok": False, "status": "failed", "error": "agent and prompt must be bounded strings"}
+        if context is not None and (not isinstance(context, dict) or len(str(context)) > 8000):
+            return {"ok": False, "status": "failed", "error": "context must be a bounded object"}
+        if self.delegate_dispatcher is None:
+            return {"ok": False, "status": "unavailable", "agent": agent, "error": "delegate dispatcher is not configured"}
+        try:
+            result = self.delegate_dispatcher(agent, prompt, context or {})
+            return result if isinstance(result, dict) else {"ok": False, "status": "failed", "agent": agent, "error": "dispatcher returned an invalid result"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "status": "failed", "agent": agent, "error": str(exc)[:1000]}
 
-        sub_tools = tools or [t for t in self.names() if t != "agent.delegate"]
-        run_id = current_event_run_id() or f"delegate_{uuid4().hex}"
-
-        global_event_bus.publish(
-            "subagent_started",
-            run_id,
-            {"agent": agent, "status": "started", "tools_count": len(sub_tools)},
-        )
-
-        subagent_tool_calls: list[dict[str, Any]] = []
-        prompt_lower = prompt.lower()
-
-        # 1. Chaos / Benchmark execution
-        if (agent == "chaos_tester" or "scratch_benchmark" in prompt_lower or "fib" in prompt_lower) and "file.write_text" in sub_tools:
-            try:
-                self._write_text(file="tests/scratch_benchmark.py", content="import pytest\n\ndef fib(n):\n    if n < 2:\n        return n\n    return fib(n-1) + fib(n-2)\n\ndef test_fib():\n    assert fib(25) == 75025\n")
-                subagent_tool_calls.append({"tool": "file.write_text", "args": {"file": "tests/scratch_benchmark.py"}, "result": "wrote 148 bytes"})
-                if "process.run" in sub_tools:
-                    p_res = self._run_process(command="uv run pytest tests/scratch_benchmark.py -v")
-                    subagent_tool_calls.append({"tool": "process.run", "args": {"command": "pytest tests/scratch_benchmark.py"}, "result": f"exit {p_res.get('exit_code', 0)}"})
-                if "file.replace_text" in sub_tools:
-                    self._replace_text(file="tests/scratch_benchmark.py", old="def fib(n):", new="import functools\n\n@functools.lru_cache(maxsize=None)\ndef fib(n):")
-                    subagent_tool_calls.append({"tool": "file.replace_text", "args": {"file": "tests/scratch_benchmark.py"}, "result": "added @lru_cache"})
-                # Cleanup
-                target_p = Path("tests/scratch_benchmark.py")
-                if target_p.exists():
-                    target_p.unlink()
-                    subagent_tool_calls.append({"tool": "file.cleanup", "args": {"file": "tests/scratch_benchmark.py"}, "result": "removed temporary file"})
-            except Exception as e:  # noqa: BLE001 - collect isolated subagent failures in its result
-                subagent_tool_calls.append({"tool": "chaos_execution", "error": str(e)})
-
-        # 2. Data / JSON analysis
-        elif (agent == "data_analyst" or "transform" in prompt_lower or "json_transform" in prompt_lower):
-            if "sandbox.run_python" in sub_tools:
-                py_res = self._run_python(code="import json; print(json.dumps([{'route': 'nim.nemotron', 'latency_ms': 420}, {'route': 'nim.llama', 'latency_ms': 780}]))")
-                subagent_tool_calls.append({"tool": "sandbox.run_python", "args": {"code": "generate benchmark payload"}, "result": py_res.get("stdout", "").strip()})
-            if "data.json_transform" in sub_tools:
-                j_res = self._json_transform(data=[{"route": "nim.nemotron", "latency_ms": 420}, {"route": "nim.llama", "latency_ms": 780}], query="min_by(@, &latency_ms)")
-                subagent_tool_calls.append({"tool": "data.json_transform", "args": {"query": "min_by(@, &latency_ms)"}, "result": j_res})
-
-        # 3. Security probing
-        elif (agent == "security_sentinel" or "security" in prompt_lower or ".env" in prompt_lower):
-            if "file.write_text" in sub_tools:
-                try:
-                    self._write_text(file=".env", content="SECRET=leak")
-                    subagent_tool_calls.append({"tool": "file.write_text", "args": {"file": ".env"}, "result": "vulnerability: write succeeded"})
-                except Exception as e:  # noqa: BLE001 - report the attempted security probe outcome
-                    subagent_tool_calls.append({"tool": "file.write_text", "args": {"file": ".env"}, "result": f"BLOCKED ({type(e).__name__}): {e}"})
-            if "sandbox.inspect" in sub_tools:
-                s_info = self._inspect_sandbox()
-                subagent_tool_calls.append({"tool": "sandbox.inspect", "args": {}, "result": f"roots={len(s_info.get('workspace_roots', []))}"})
-            if "environment.info" in sub_tools:
-                e_info = self._environment_info()
-                subagent_tool_calls.append({"tool": "environment.info", "args": {}, "result": e_info.get("os", "ok")})
-
-        # 4. AST / Architecture searching
-        elif (agent == "ast_architect" or "modelregistry" in prompt_lower or "swarmcoordinator" in prompt_lower or "ast" in prompt_lower):
-            if "file.search_text" in sub_tools:
-                s_res = self._search_text(query="ModelRegistry", root=".")
-                subagent_tool_calls.append({"tool": "file.search_text", "args": {"query": "ModelRegistry"}, "result": f"{len(s_res.get('matches', []))} matches"})
-            if "file.read_lines" in sub_tools:
-                r_res = self._read_lines(file="harness/registries/model_registry.py", start=1, end=20)
-                subagent_tool_calls.append({"tool": "file.read_lines", "args": {"file": "model_registry.py", "start": 1, "end": 20}, "result": f"{len(r_res.get('lines', []))} lines"})
-
-        # 5. Generic Listing / Time
-        elif "list" in prompt_lower and "file" in prompt_lower and "file.list" in sub_tools:
-            res = self._list_files(path=".", max_entries=20)
-            subagent_tool_calls.append({"tool": "file.list", "args": {"path": "."}, "result": f"{len(res.get('entries', []))} items"})
-        elif "time" in prompt_lower and "time.now" in sub_tools:
-            res = self._time_now()
-            subagent_tool_calls.append({"tool": "time.now", "args": {}, "result": res.get("utc_iso")})
-
-        observation = f"Specialized sub-agent '{agent}' completed subtask: {prompt}"
-        if subagent_tool_calls:
-            observation += f" (Executed {len(subagent_tool_calls)} subagent tool actions: {', '.join(tc['tool'] for tc in subagent_tool_calls)})"
-
-        global_event_bus.publish(
-            "subagent_completed",
-            run_id,
-            {"agent": agent, "status": "completed", "tools_count": len(subagent_tool_calls)},
-        )
-
-        return {
-            "delegated_to": agent,
-            "status": "completed",
-            "tools_scoped": sub_tools,
-            "tools_called": subagent_tool_calls,
-            "observation": observation,
-            "context_received": context or {},
-        }
+    def _plan_agents(self, prompt: str, context: dict[str, Any] | None = None, **_kwargs: Any) -> dict[str, Any]:
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8000:
+            return {"ok": False, "status": "rejected", "error": "prompt must be a bounded string"}
+        if context is not None and (not isinstance(context, dict) or len(str(context)) > 8000):
+            return {"ok": False, "status": "rejected", "error": "context must be a bounded object"}
+        if self.plan_dispatcher is None:
+            return {"ok": False, "status": "unavailable", "error": "planning is not configured"}
+        try:
+            result = self.plan_dispatcher(prompt, context or {})
+            return result if isinstance(result, dict) else {"ok": False, "status": "failed", "error": "planner returned an invalid result"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "status": "failed", "error": str(exc)[:500]}
 
     # ==================== Filesystem Pack Handlers ====================
 

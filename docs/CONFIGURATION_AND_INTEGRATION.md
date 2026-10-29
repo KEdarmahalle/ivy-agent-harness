@@ -250,6 +250,72 @@ rotation, least privilege, and a secret manager when deploying beyond localhost.
   contain user/task data; apply your data retention and redaction policy before
   enabling a remote sink.
 
+### 3.8 Configurable agent orchestration
+
+`agents.profiles` defines the complete profile roster and each profile's route,
+system prompt, tools, skills, metadata, and delegation policy. Set
+`agents.include_builtins: false` to avoid adding the compatibility profile
+catalogue to a custom orchestration topology. Profile IDs are configuration
+identifiers; labels such as `planner`, `reviewer`, or `worker` have no special
+runtime meaning.
+
+`orchestration.chat_entry_profile` selects the profile that represents the
+conversation. `planner_profile` optionally selects any configured profile to
+propose plans. `mode` controls whether delegation is disabled (`off`), a single
+specialist can be selected (`single`), profile-defined delegation and task DAGs
+are available (`self_directed`), or a validated plan is required before tool
+execution (`required`).
+
+`planning_strategy` makes model autonomy explicit:
+
+- `deterministic` is the default. It disables the model-facing `agent.plan`
+  operation. A host can execute a preconstructed `TaskPlan` through the
+  coordinator API or use the explicit fan-out API; the scheduler obeys that
+  supplied plan and configured limits.
+- `model_directed` opts in to LLM-proposed task DAGs. The runtime validates the
+  complete proposal before launching tasks. `required` mode requires this
+  strategy and fails during startup otherwise.
+
+Model responses may include Markdown fences or short explanatory text around
+the JSON. The parser accepts those common wrappers only when it finds exactly
+one complete object with the required plan envelope. It rejects duplicate keys,
+multiple different plans, invalid JSON constants, and responses over 64 KB. It
+never guesses missing braces or tasks. `planner_retries` (default `1`, maximum
+`2`) retries a format failure with the original request and a stricter format
+reminder; oversized responses are rejected immediately. The plan still must
+pass normal authorization and DAG validation before any child agent starts.
+`planner_json_mode` defaults to `true` and asks the configured planner route for
+JSON output using the provider's OpenAI-compatible `response_format` option.
+Set it to `false` for endpoints that reject this option. This mode constrains
+format only; the harness still applies its own strict parser and authorization
+checks. The planner uses the route on `planner_profile`, independently of the
+chat route selected on the CLI. The sample `assistant` profile is now routed to
+`gemini.flash`; backend specialist profiles remain routed to NIM. Configure the
+planner profile's route explicitly when you want planning to use a different
+provider than the chat route. A bounded failure reports the planner route,
+finish reason, and response byte count without exposing model text.
+The same bounded object parser is used by dynamic graph routing and research
+report synthesis. Router parse failures stop routing safely; research reports
+accept claims only after their independent source-quote validation, and malformed
+model text is not copied into the report summary.
+
+`max_depth`, `max_total_agents`, `max_parallel_agents`, `max_plan_tasks`,
+`max_total_tool_calls`, `timeout_seconds`, `failure_policy`, and
+`result_bytes_per_task` bound one run. Each profile's `delegation` policy
+controls whether it may create child work, its target IDs/tags, child count,
+parallel children, depth, and budget. Target authorization never grants tools:
+each child continues to use only its configured tools intersected with the
+global allowlist and current approval policy. Child tasks receive only explicit
+input references, not the full parent conversation.
+
+Independent tasks execute concurrently within the configured limits; dependent
+tasks wait for their declared inputs. `continue_independent` allows unaffected
+branches to complete after a task failure, while `fail_fast` blocks pending
+branches. A child timeout marks that child timed out and does not cancel
+independent siblings. This is in-process orchestration, not a durable worker
+queue; process restart recovery and exactly-once external side effects are not
+provided by this feature.
+
 ## 4. Python SDK integration
 
 Install the package in the host application environment, then create one harness
@@ -277,6 +343,33 @@ result = harness.run(
 print(result.final_output)
 print(result.tool_calls)
 ```
+
+For a deterministic multi-agent flow, the host can supply the plan directly; no
+planning model call is made. Each task still passes the same profile-target,
+dependency, context-reference, and budget validation:
+
+```python
+plan = {
+    "schema_version": 1,
+    "goal": "Review a change",
+    "tasks": [
+        {"id": "security", "profile": "security-reviewer",
+         "task": "Review the change for security issues", "depends_on": [], "inputs": []},
+        {"id": "tests", "profile": "test-reviewer",
+         "task": "Review test coverage", "depends_on": [], "inputs": []},
+        {"id": "summary", "profile": "reviewer",
+         "task": "Combine both reports", "depends_on": ["security", "tests"],
+         "inputs": ["security.result", "tests.result"]},
+    ],
+}
+result = harness.execute_plan(plan)
+```
+
+To let the configured model create the DAG from the current request, explicitly
+set `orchestration.planning_strategy: model_directed` and call
+`harness.plan(prompt)` or enable the model-facing `agent.plan` operation for the
+configured chat profile. This changes who proposes the task graph; all plans
+still pass the same deterministic runtime validation and capability checks.
 
 `AgentHarness` also exposes `stream(prompt, config)` for synchronous typed events
 and async variants (`arun` / `astream`) for async applications. `AgentResult`
@@ -410,6 +503,9 @@ deployment environment before exposing the service publicly.
   coverage and proposed workflow behavior.
 - [Advanced scenario implementation plan](ADVANCED_SCENARIO_IMPLEMENTATION_PLAN.md):
   planned acceptance criteria for selected workflows.
+- [Self-directing hierarchical orchestration plan](SELF_DIRECTING_HIERARCHICAL_ORCHESTRATION_PLAN.md):
+  proposed next layer for model-selected teams, bounded delegation hierarchies,
+  plan validation, and execution.
 - [Production readiness review](PRODUCTION_READINESS_REVIEW.md): security and
   reliability findings; re-check against the current commit before acting on any
   historical finding.
@@ -419,3 +515,22 @@ deployment environment before exposing the service publicly.
   route and tool-loop exercises.
 - [Leadership demo pitch](GENAI_LEADERSHIP_DEMO_PITCH.md): presentation material,
   not an engineering contract.
+
+# Configurable specialist profiles
+
+Define trusted specialists under `agents.profiles` in `config.yaml`. Each profile requires an existing model `route`, a bounded `system_prompt`, and a list of `tools`. Tool names must be registered and included in the global `tools.allowlist`; the profile only narrows that set. Optional `skills` must name installed skills, and `max_tool_turns` is from 1 through 10.
+
+```yaml
+agents:
+  profiles:
+    researcher:
+      description: Collect evidence and summarize uncertainty.
+      route: nim.nemotron
+      system_prompt: You are a careful research specialist.
+      tools: [web.fetch_url]
+      skills: []
+      max_tool_turns: 3
+      can_handoff_to: [reviewer]
+```
+
+The normal chat loop exposes `agent.delegate` and appends its structured result to the conversation for the primary agent to continue. In Python, `AgentHarness` uses the same configured profiles; `harness.swarm(task, agents=[...])` and the CLI `swarm` command require registered names. Unknown names fail closed. Specialists cannot choose their own route, tools, or skills. Approval-gated or mutating tools require an active auto-approval principal and remain subject to the global tool policy. Skills supply context only and do not grant tools. Profiles are bounded to 100 entries; each profile allows at most 50 tools, 10 skills, 50 unique handoff targets, 10 tool turns, 32 KB of skill instructions per invocation, and 16 KB of serialized arguments per tool call.

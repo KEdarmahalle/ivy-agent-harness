@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,18 @@ class SecureWorkflowBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.state_updates["routing_error"], "RuntimeError")
         self.assertNotIn("provider secret", decision.rationale)
 
+    def test_router_finishes_when_model_omits_or_malforms_next_node(self) -> None:
+        router = AgenticGraphRouter(models=ModelRegistry.from_config({}))
+        for target in (None, "", ["next"]):
+            with self.subTest(target=target):
+                decision = router._parse_decision(
+                    '{"action":"advance","next_node":' + json.dumps(target) + ',"rationale":"go"}',
+                    {"next": {}},
+                )
+                self.assertEqual(decision.action, "finish")
+                self.assertIsNone(decision.next_node)
+                self.assertEqual(decision.state_updates["routing_error"], "missing_target")
+
     async def test_graph_execution_has_a_bounded_step_count(self) -> None:
         config = {
             "engine": {"max_graph_steps": 3},
@@ -60,6 +73,21 @@ class SecureWorkflowBoundaryTests(unittest.IsolatedAsyncioTestCase):
             {"next": {}},
         )
         self.assertLessEqual(sum(len(str(k)) + len(str(v)) for k, v in decision.state_updates.items()), 8_100)
+
+    def test_router_accepts_fenced_json_but_rejects_ambiguous_objects(self) -> None:
+        router = AgenticGraphRouter(models=ModelRegistry.from_config({}))
+        valid = router._parse_decision(
+            'The routing decision is:\n```json\n{"action":"advance","next_node":"next","rationale":"continue","state_updates":{}}\n```',
+            {"next": {}},
+        )
+        self.assertEqual((valid.action, valid.next_node), ("advance", "next"))
+        ambiguous = router._parse_decision(
+            '{"action":"advance","next_node":"next","rationale":"a","state_updates":{}} '
+            '{"action":"advance","next_node":"other","rationale":"b","state_updates":{}}',
+            {"next": {}, "other": {}},
+        )
+        self.assertEqual(ambiguous.action, "finish")
+        self.assertEqual(ambiguous.state_updates["routing_error"], "ambiguous")
 
     def test_declarative_manifest_validates_start_and_route_references(self) -> None:
         valid = {"start_node": "begin", "nodes": {"begin": {"next": "finish"}, "finish": {}}}

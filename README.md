@@ -64,6 +64,8 @@ print(result.final_output)
 - [Configuration and Integration Guide](docs/CONFIGURATION_AND_INTEGRATION.md)
 - [Advanced Use-Case Scenarios](docs/ADVANCED_USE_CASE_SCENARIOS.md)
 - [Scenario Implementation Plan](docs/ADVANCED_SCENARIO_IMPLEMENTATION_PLAN.md)
+- [Differentiating Features Test Plan](docs/DIFFERENTIATING_FEATURES_TEST_PLAN.md)
+- [Self-Directing Hierarchical Orchestration Plan](docs/SELF_DIRECTING_HIERARCHICAL_ORCHESTRATION_PLAN.md)
 - [Production Readiness Review](docs/PRODUCTION_READINESS_REVIEW.md)
 - [Harness Evolution and Gap Analysis](docs/DYNAMIC_HARNESS_EVOLUTION_AND_GAP_ANALYSIS.md)
 - [Gemini Harness Stress Test](docs/GEMINI_HARNESS_STRESS_TEST.md)
@@ -82,3 +84,14 @@ The sample is aimed at local development, not an internet-facing deployment.
 Review authentication, approval settings, tool allowlists, sandbox policy,
 storage, and deployment-specific controls in the integration guide before
 exposing the API to other users.
+# Configurable agent orchestration
+
+Configure any conversational entry profile, specialist roster, system prompts,
+skills, tools, and delegation edges under `agents.profiles`. The runtime does
+not require hard-coded director, supervisor, or worker roles. `planning_strategy`
+defaults to `deterministic`, where the host supplies a task plan; select
+`model_directed` to let the configured model propose a multi-agent DAG. The
+runtime validates either plan against the same profile permissions, dependency
+rules, concurrency limits, and cumulative budgets. See the
+[configuration and integration guide](docs/CONFIGURATION_AND_INTEGRATION.md#configurable-agent-orchestration)
+for the schema, SDK example, and security boundaries.
